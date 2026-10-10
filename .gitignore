@@ -1,13 +1,68 @@
+# Byte-compiled / optimize / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
-*.env
+
+# C extensions
+*.so
+
+# Dağıtım / Paketleme
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Sanal Ortamlar (Virtual Environments)
 venv/
 .venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Veritabanı ve Yerel Veriler
 *.db
+*.sqlite
 *.sqlite3
+data/*.db
+data/*.sqlite
+data/*.sqlite3
 data/cache/
-streamlit/secrets.toml
+!data/.gitkeep
+
+# Çevre Değişkenleri ve Gizli Anahtarlar
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# AI Agent Yerel Kuralları
+.agentrules
+.cursorrules
+
+# IDE ve Editör Konfigürasyonları
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+
+# İşletim Sistemi Kalıntıları
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
