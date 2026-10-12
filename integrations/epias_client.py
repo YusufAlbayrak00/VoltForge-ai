@@ -9,6 +9,8 @@ hatalarını yönetmekten sorumludur.
 import random
 from datetime import datetime
 
+import requests
+
 
 class EpiasClient:
     """EPİAŞ Şeffaflık Platformu için istemci sınıfı (iskelet).
@@ -66,3 +68,54 @@ class EpiasClient:
                 }
             )
         return mock_data
+
+    def fetch_daily_ptf(self, target_date: str) -> list[dict]:
+        """Belirtilen tarih için saatlik PTF verisini EPİAŞ GÖP API'sinden çeker.
+
+        Önce EPİAŞ Şeffaflık Platformu GÖP uç noktasına istek atmayı dener.
+        Zaman aşımı, bağlantı hatası, HTTP hata kodu (4xx/5xx), geçersiz JSON
+        veya boş/beklenmeyen yanıt gibi herhangi bir sorunda program çökmez;
+        konsola uyarı basılır ve ``_generate_mock_data`` ile üretilen
+        simülasyon verisi döndürülür.
+
+        Not:
+            Kullanılan URL şimdilik temsilidir; gerçek uç nokta ve yanıt şeması
+            sonraki adımlarda netleştirilip yanıt normalize edilecektir.
+
+        Args:
+            target_date: Hedef tarih, ``YYYY-MM-DD`` formatında (ör. ``"2026-10-12"``).
+
+        Returns:
+            Saatlik PTF kayıtlarını içeren sözlük listesi. Canlı veri alınırsa
+            API yanıtındaki kayıtlar, alınamazsa 24 elemanlı simülasyon verisi
+            (``date``, ``hour``, ``ptf`` anahtarlı) döner.
+
+        Raises:
+            ValueError: ``target_date`` ``YYYY-MM-DD`` formatında değilse
+                (bu bir çağıran taraf hatasıdır, yedek veriye düşülmez).
+        """
+        # Hatalı tarih formatını ağ isteği atmadan önce yakala.
+        datetime.strptime(target_date, "%Y-%m-%d")
+
+        api_url = "https://seffaflik.epias.com.tr/api/market/gop"
+        timeout_seconds = 10
+
+        try:
+            response = requests.get(
+                api_url,
+                params={"date": target_date},
+                timeout=timeout_seconds,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            if not isinstance(data, list) or not data:
+                raise ValueError("API yanıtı beklenen formatta değil veya boş.")
+
+            return data
+        except (requests.exceptions.RequestException, ValueError) as error:
+            print(
+                "Canlı veri alınamadı, simülasyon verisi kullanılıyor... "
+                f"(Sebep: {type(error).__name__}: {error})"
+            )
+            return self._generate_mock_data(target_date)
