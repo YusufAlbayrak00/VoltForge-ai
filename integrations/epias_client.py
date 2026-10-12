@@ -45,10 +45,11 @@ class EpiasClient:
             target_date: Hedef tarih, ``YYYY-MM-DD`` formatında (ör. ``"2026-10-12"``).
 
         Returns:
-            24 elemanlı bir liste. Her eleman şu anahtarları içeren sözlüktür:
-                - ``date`` (str): ``YYYY-MM-DD`` formatında tarih.
-                - ``hour`` (str): ``HH:00`` formatında saat.
-                - ``ptf`` (float): Piyasa Takas Fiyatı (TL/MWh), 2 basamağa yuvarlanmış.
+            24 elemanlı bir liste. Her eleman şu anahtarları içeren sözlüktür
+            (``_parse_epias_response`` çıktısıyla birebir aynı şema):
+                - ``target_date`` (str): ``YYYY-MM-DD`` formatında tarih.
+                - ``hour`` (int): Günün saati (0-23).
+                - ``ptf_try_mwh`` (float): Piyasa Takas Fiyatı (TL/MWh), 2 basamağa yuvarlanmış.
 
         Raises:
             ValueError: ``target_date`` beklenen formatta değilse.
@@ -62,9 +63,9 @@ class EpiasClient:
             price = round(base_price * (1 + noise), 2)
             mock_data.append(
                 {
-                    "date": parsed_date.isoformat(),
-                    "hour": f"{hour:02d}:00",
-                    "ptf": price,
+                    "target_date": parsed_date.isoformat(),
+                    "hour": hour,
+                    "ptf_try_mwh": price,
                 }
             )
         return mock_data
@@ -79,16 +80,18 @@ class EpiasClient:
         simülasyon verisi döndürülür.
 
         Not:
-            Kullanılan URL şimdilik temsilidir; gerçek uç nokta ve yanıt şeması
-            sonraki adımlarda netleştirilip yanıt normalize edilecektir.
+            Kullanılan URL şimdilik temsilidir. Başarılı yanıt, ham haliyle
+            değil, ``_parse_epias_response`` ile standart şemaya çevrilerek
+            döndürülür; şema bozuksa yedek veriye düşülür.
 
         Args:
             target_date: Hedef tarih, ``YYYY-MM-DD`` formatında (ör. ``"2026-10-12"``).
 
         Returns:
-            Saatlik PTF kayıtlarını içeren sözlük listesi. Canlı veri alınırsa
-            API yanıtındaki kayıtlar, alınamazsa 24 elemanlı simülasyon verisi
-            (``date``, ``hour``, ``ptf`` anahtarlı) döner.
+            Standart şemada saatlik PTF kayıtlarını içeren sözlük listesi.
+            Canlı veri ``_parse_epias_response`` ile, alınamazsa
+            ``_generate_mock_data`` ile üretilir; her iki durumda da
+            anahtarlar aynıdır (``target_date``, ``hour``, ``ptf_try_mwh``).
 
         Raises:
             ValueError: ``target_date`` ``YYYY-MM-DD`` formatında değilse
@@ -107,15 +110,61 @@ class EpiasClient:
                 timeout=timeout_seconds,
             )
             response.raise_for_status()
-            data = response.json()
+            raw_json = response.json()
 
-            if not isinstance(data, list) or not data:
-                raise ValueError("API yanıtı beklenen formatta değil veya boş.")
-
-            return data
+            # Ham yanıtı standart şemaya çevir; şema bozuksa ValueError fırlatır.
+            return self._parse_epias_response(raw_json)
         except (requests.exceptions.RequestException, ValueError) as error:
             print(
                 "Canlı veri alınamadı, simülasyon verisi kullanılıyor... "
                 f"(Sebep: {type(error).__name__}: {error})"
             )
             return self._generate_mock_data(target_date)
+
+    def _parse_epias_response(self, raw_json: dict) -> list[dict]:
+        """EPİAŞ'tan gelen ham JSON yanıtını standart şemaya dönüştürür.
+
+        Beklenen ham format::
+
+            {"items": [{"date": "2026-10-12T00:00:00+03:00", "price": 1500.50}, ...]}
+
+        Üretilen format (``_generate_mock_data`` ile birebir aynıdır)::
+
+            [{"target_date": "2026-10-12", "hour": 0, "ptf_try_mwh": 1500.50}, ...]
+
+        Tarih ve saat bilgisi ``datetime.fromisoformat`` ile ayrıştırılır;
+        saat, kaydın kendi saat dilimindeki (yerel) saatidir.
+
+        Args:
+            raw_json: EPİAŞ API'sinden dönen, JSON'dan çevrilmiş ham sözlük.
+
+        Returns:
+            Standart şemada saatlik PTF kayıtlarını içeren sözlük listesi.
+
+        Raises:
+            ValueError: Yanıt sözlük değilse, ``items`` yoksa/boşsa veya
+                herhangi bir kayıtta ``date``/``price`` eksik ya da hatalıysa.
+        """
+        if not isinstance(raw_json, dict):
+            raise ValueError("API yanıtı bir JSON nesnesi (dict) değil.")
+
+        items = raw_json.get("items")
+        if not isinstance(items, list) or not items:
+            raise ValueError("API yanıtında 'items' listesi yok veya boş.")
+
+        parsed: list[dict] = []
+        for item in items:
+            try:
+                timestamp = datetime.fromisoformat(item["date"])
+                price = float(item["price"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(f"Hatalı EPİAŞ kaydı: {item!r} ({error})") from error
+
+            parsed.append(
+                {
+                    "target_date": timestamp.date().isoformat(),
+                    "hour": timestamp.hour,
+                    "ptf_try_mwh": price,
+                }
+            )
+        return parsed
