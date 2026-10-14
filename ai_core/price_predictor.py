@@ -83,6 +83,59 @@ class PricePredictor:
         result['is_holiday_eve'] = (next_is_holiday & (result['is_holiday'] == 0)).astype(int)
         return result
 
+    def _validate_training_data(self, df: pd.DataFrame) -> None:
+        """Eğitim verisinin modele verilmeden önce geçerliliğini doğrular.
+
+        Kontroller sırasıyla şöyledir ve ilk başarısız kontrolde açıklayıcı
+        bir Türkçe mesajla ``ValueError`` fırlatılır:
+
+        1. ``df`` ``None`` mı veya boş mu (``df.empty``).
+        2. Zorunlu sütunlardan (``target_date``, ``hour``, ``ptf_try_mwh``)
+           herhangi biri eksik mi.
+        3. Zorunlu sütunlarda boş (``NaN`` / ``null``) değer var mı.
+        4. Toplam satır sayısı 24'ten az mı (en az 1 tam günlük veri şartı).
+
+        Args:
+            df: Doğrulanacak geçmiş saatlik PTF verisini içeren DataFrame.
+
+        Raises:
+            ValueError: Yukarıdaki kontrollerden herhangi biri başarısız
+                olduğunda.
+        """
+        required_columns: List[str] = ['target_date', 'hour', 'ptf_try_mwh']
+
+        if df is None or df.empty:
+            raise ValueError(
+                "Eğitim verisi boş veya None olamaz; en az 1 tam günlük "
+                "(24 saatlik) PTF verisi gereklidir."
+            )
+
+        missing_columns: List[str] = [
+            col for col in required_columns if col not in df.columns
+        ]
+        if missing_columns:
+            raise ValueError(
+                f"Eğitim verisinde zorunlu sütun(lar) eksik: {missing_columns}. "
+                f"Beklenen sütunlar: {required_columns}."
+            )
+
+        null_counts: pd.Series = df[required_columns].isna().sum()
+        columns_with_nulls: pd.Series = null_counts[null_counts > 0]
+        if not columns_with_nulls.empty:
+            details: str = ", ".join(
+                f"{col}: {int(count)} adet" for col, count in columns_with_nulls.items()
+            )
+            raise ValueError(
+                f"Zorunlu sütunlarda boş (NaN/null) değerler bulundu -> {details}. "
+                "Lütfen eksik verileri temizleyin veya doldurun."
+            )
+
+        if len(df) < 24:
+            raise ValueError(
+                f"Yetersiz eğitim verisi: {len(df)} satır bulundu, en az 24 satır "
+                "(1 tam günlük veri) gereklidir."
+            )
+
     def train(self, df: pd.DataFrame) -> None:
         """Fiyat tahmin modelini verilen geçmiş verilerle eğitir (şablon).
 
