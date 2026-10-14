@@ -6,9 +6,10 @@ saatlik elektrik fiyatlarını tahminleyen makine öğrenimi modellerini (ML reg
 ve öznitelik mühendisliği (feature engineering) boru hatlarını barındırır.
 """
 
-from typing import List, Optional
+from typing import List
 
 import holidays
+import lightgbm as lgb
 import pandas as pd
 
 
@@ -20,18 +21,28 @@ class PricePredictor:
     temel nitelikleri tanımlar.
 
     Attributes:
-        model: Eğitilmiş tahmin modeli. Henüz eğitilmediği için ``None``'dır.
+        model: Hiperparametreleri yapılandırılmış, henüz eğitilmemiş
+            ``lightgbm.LGBMRegressor`` nesnesi.
         features: Modelin kullanacağı takvim özniteliklerinin adları.
+        is_trained: Modelin eğitilip eğitilmediğini takip eden durum değişkeni.
     """
 
     def __init__(self) -> None:
         """PricePredictor nesnesini başlangıç değerleriyle oluşturur.
 
-        ``model`` niteliği henüz bir model yüklenmediği için ``None`` olarak,
-        ``features`` niteliği ise kullanılacak takvim özniteliklerinin
-        listesi olarak ayarlanır.
+        ``model`` niteliği, aşırı öğrenmeyi sınırlayan muhafazakâr
+        hiperparametrelerle yapılandırılmış bir ``LGBMRegressor`` olarak,
+        ``features`` niteliği kullanılacak takvim özniteliklerinin listesi
+        olarak, ``is_trained`` ise ``False`` olarak ayarlanır.
         """
-        self.model: Optional[object] = None
+        self.model: lgb.LGBMRegressor = lgb.LGBMRegressor(
+            n_estimators=100,
+            learning_rate=0.05,
+            max_depth=6,
+            random_state=42,
+            verbose=-1,
+        )
+        self.is_trained: bool = False
         self.features: List[str] = [
             'hour', 'day_of_week', 'is_weekend', 'is_holiday', 'is_holiday_eve'
         ]
