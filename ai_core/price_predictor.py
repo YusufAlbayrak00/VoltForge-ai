@@ -137,16 +137,37 @@ class PricePredictor:
             )
 
     def train(self, df: pd.DataFrame) -> None:
-        """Fiyat tahmin modelini verilen geçmiş verilerle eğitir (şablon).
+        """Fiyat tahmin modelini verilen geçmiş PTF verisiyle eğitir.
 
-        Henüz uygulanmamıştır; ileride ``target_date``, ``hour`` ve hedef
-        fiyat sütunlarını içeren geçmiş PTF verisi ile model eğitimi burada
-        yapılacaktır.
+        Eğitim adımları sırasıyla şöyledir:
+
+        1. ``_validate_training_data`` ile veri doğrulanır (boş/None, eksik
+           sütun, NaN değer, 24 satırdan az veri durumlarında ``ValueError``).
+        2. Orijinal DataFrame'i değiştirmemek için ``df.copy()`` üzerinden
+           ``_extract_features`` çağrılarak takvim öznitelikleri
+           (``day_of_week``, ``is_weekend``, ``is_holiday``,
+           ``is_holiday_eve``) üretilir.
+        3. ``self.features`` sütunları özellik matrisi ``X``, ``ptf_try_mwh``
+           sütunu hedef değişken ``y`` olarak ayrılır.
+        4. ``self.model.fit(X, y)`` ile LightGBM modeli eğitilir.
+        5. Eğitim başarıyla tamamlanırsa ``self.is_trained`` ``True`` yapılır.
 
         Args:
-            df: Geçmiş saatlik PTF verisini içeren DataFrame.
+            df: ``target_date``, ``hour`` ve ``ptf_try_mwh`` sütunlarını
+                içeren geçmiş saatlik PTF verisi. Bu DataFrame değiştirilmez.
+
+        Raises:
+            ValueError: Eğitim verisi doğrulamayı geçemezse.
         """
-        pass
+        self._validate_training_data(df)
+
+        processed_df: pd.DataFrame = self._extract_features(df.copy())
+
+        X: pd.DataFrame = processed_df[self.features]
+        y: pd.Series = processed_df['ptf_try_mwh']
+
+        self.model.fit(X, y)
+        self.is_trained = True
 
     def predict(self, target_date: str) -> dict:
         """Verilen tarih için saatlik fiyat tahminlerini döndürür (şablon).
