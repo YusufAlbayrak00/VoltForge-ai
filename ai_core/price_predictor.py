@@ -6,11 +6,16 @@ saatlik elektrik fiyatlarını tahminleyen makine öğrenimi modellerini (ML reg
 ve öznitelik mühendisliği (feature engineering) boru hatlarını barındırır.
 """
 
+import logging
 from typing import List
 
 import holidays
 import lightgbm as lgb
+import numpy as np
 import pandas as pd
+from sklearn.metrics import mean_absolute_error, root_mean_squared_error
+
+logger = logging.getLogger(__name__)
 
 
 class PricePredictor:
@@ -204,6 +209,60 @@ class PricePredictor:
 
         self.model.fit(X, y)
         self.is_trained = True
+
+    def evaluate(self, df: pd.DataFrame) -> dict[str, float]:
+        """Eğitilmiş modelin başarımını test verisi üzerinde ölçer.
+
+        Adımlar: eğitim durumu kontrolü, ``_validate_training_data`` ile
+        doğrulama, ``_extract_features`` ile öznitelik üretimi, tahmin ve
+        metrik hesabı. Metrikler:
+
+        - ``mae``: Ortalama Mutlak Hata (TL/MWh).
+        - ``rmse``: Kök Ortalama Kare Hata (TL/MWh).
+        - ``mape``: Ortalama Mutlak Yüzde Hata (%). Payda
+          ``np.maximum(np.abs(y_true), 1e-8)`` ile sıfıra bölünmeye karşı
+          korunur.
+
+        Args:
+            df: ``target_date``, ``hour`` ve ``ptf_try_mwh`` sütunlarını
+                içeren test verisi. Bu DataFrame değiştirilmez.
+
+        Returns:
+            ``{"mae": ..., "rmse": ..., "mape": ...}`` sözlüğü (2 ondalık).
+
+        Raises:
+            RuntimeError: Model henüz eğitilmemişse.
+            ValueError: Test verisi doğrulamayı geçemezse.
+        """
+        if not self.is_trained:
+            raise RuntimeError(
+                "Model henüz eğitilmedi; değerlendirme yapmadan önce "
+                "train() metodunu çağırın."
+            )
+
+        self._validate_training_data(df)
+        featured_df: pd.DataFrame = self._extract_features(df)
+
+        X: pd.DataFrame = featured_df[self.features]
+        y_true: pd.Series = featured_df['ptf_try_mwh']
+        y_pred = self.model.predict(X)
+
+        mae: float = mean_absolute_error(y_true, y_pred)
+        rmse: float = root_mean_squared_error(y_true, y_pred)
+        mape: float = float(
+            np.mean(np.abs(y_true - y_pred) / np.maximum(np.abs(y_true), 1e-8)) * 100
+        )
+
+        metrics: dict[str, float] = {
+            "mae": round(float(mae), 2),
+            "rmse": round(float(rmse), 2),
+            "mape": round(float(mape), 2),
+        }
+        logger.info(
+            "Model değerlendirme -> MAE: %.2f TL/MWh, RMSE: %.2f TL/MWh, MAPE: %.2f%%",
+            metrics["mae"], metrics["rmse"], metrics["mape"],
+        )
+        return metrics
 
     def predict(self, target_date: str) -> dict:
         """Verilen tarih için saatlik fiyat tahminlerini döndürür (şablon).
