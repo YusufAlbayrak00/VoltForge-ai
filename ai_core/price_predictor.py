@@ -7,9 +7,11 @@ ve öznitelik mühendisliği (feature engineering) boru hatlarını barındırı
 """
 
 import logging
+from pathlib import Path
 from typing import List
 
 import holidays
+import joblib
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
@@ -264,16 +266,115 @@ class PricePredictor:
         )
         return metrics
 
-    def predict(self, target_date: str) -> dict:
-        """Verilen tarih için saatlik fiyat tahminlerini döndürür (şablon).
-
-        Henüz uygulanmamıştır; ileride ``target_date`` (``YYYY-MM-DD``) için
-        24 saatlik tahmin sonuçlarını içeren bir sözlük döndürecektir.
+    def _create_prediction_grid(self, target_date: str) -> pd.DataFrame:
+        """Verilen gün için 24 saatlik (0-23) tahmin şablonunu oluşturur.
 
         Args:
             target_date: Tahmin yapılacak gün (``YYYY-MM-DD`` formatında string).
 
         Returns:
-            Saatlik tahminleri içeren sözlük.
+            ``target_date`` ve ``hour`` (0-23) sütunlarını içeren 24 satırlık
+            DataFrame.
+
+        Raises:
+            ValueError: ``target_date`` ``YYYY-MM-DD`` formatında değilse.
         """
-        pass
+        try:
+            pd.to_datetime(target_date, format='%Y-%m-%d')
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"Geçersiz target_date: {target_date!r}. Beklenen format: YYYY-MM-DD."
+            ) from exc
+
+        return pd.DataFrame({
+            'target_date': [target_date] * 24,
+            'hour': list(range(24)),
+        })
+
+    def predict(
+        self, target_date: str, historical_df: pd.DataFrame | None = None
+    ) -> pd.DataFrame:
+        """Verilen gün için 24 saatlik PTF tahmini üretir.
+
+        ``historical_df`` verilmişse geçmiş veri ile 24 saatlik gelecek şablonu
+        alt alta birleştirilir ve ``_extract_features`` birleşik tablo üzerinde
+        çalıştırılır; böylece ``lag_24``, ``lag_168`` ve ``rolling_mean_24``
+        gerçek geçmiş fiyatlardan hesaplanır. Yalnızca son 24 satır (gelecek
+        günü) tahmin için kullanılır. ``historical_df`` verilmezse öznitelikler
+        doğrudan şablon üzerinde üretilir (lag sütunları ``0.0`` olur).
+        Tahminler negatif olamayacağı için ``np.maximum(preds, 0.0)`` ile
+        sınırlanır ve 2 ondalığa yuvarlanır.
+
+        Args:
+            target_date: Tahmin yapılacak gün (``YYYY-MM-DD`` formatında string).
+            historical_df: ``target_date``, ``hour`` ve ``ptf_try_mwh``
+                sütunlarını içeren geçmiş veri (tercihen tahmin gününden
+                önceki en az 168 ardışık saat). Değiştirilmez.
+
+        Returns:
+            ``target_date``, ``hour`` ve ``predicted_ptf_try_mwh`` sütunlarını
+            içeren 24 satırlık DataFrame.
+
+        Raises:
+            RuntimeError: Model henüz eğitilmemişse.
+            ValueError: ``target_date`` geçersizse.
+        """
+        if not self.is_trained:
+            raise RuntimeError(
+                "Model henüz eğitilmedi; tahmin yapmadan önce train() veya "
+                "load_model() metodunu çağırın."
+            )
+
+        future_grid: pd.DataFrame = self._create_prediction_grid(target_date)
+
+        if historical_df is not None and not historical_df.empty:
+            combined_df: pd.DataFrame = pd.concat(
+                [historical_df.copy(), future_grid], ignore_index=True
+            )
+            featured_future: pd.DataFrame = self._extract_features(combined_df).tail(24).copy()
+        else:
+            featured_future = self._extract_features(future_grid)
+
+        X_pred: pd.DataFrame = featured_future[self.features]
+        preds = self.model.predict(X_pred)
+        featured_future['predicted_ptf_try_mwh'] = np.round(np.maximum(preds, 0.0), 2)
+
+        return featured_future[['target_date', 'hour', 'predicted_ptf_try_mwh']].reset_index(
+            drop=True
+        )
+
+    def save_model(self, filepath: str | Path) -> None:
+        """Eğitilmiş modeli ``joblib`` ile diske kaydeder.
+
+        Args:
+            filepath: Kaydedilecek dosya yolu. Üst klasör yoksa oluşturulur.
+
+        Raises:
+            RuntimeError: Model henüz eğitilmemişse.
+        """
+        if not self.is_trained:
+            raise RuntimeError(
+                "Model henüz eğitilmedi; kaydedilecek eğitilmiş bir model yok."
+            )
+
+        path: Path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(self.model, path)
+        logger.info("Model kaydedildi: %s", path)
+
+    def load_model(self, filepath: str | Path) -> None:
+        """``joblib`` ile kaydedilmiş modeli yükler ve ``is_trained`` yapar.
+
+        Args:
+            filepath: Yüklenecek model dosyasının yolu.
+
+        Raises:
+            FileNotFoundError: Dosya mevcut değilse.
+        """
+        path: Path = Path(filepath)
+        if not path.is_file():
+            raise FileNotFoundError(f"Model dosyası bulunamadı: {path}")
+
+        self.model = joblib.load(path)
+        self.is_trained = True
+        logger.info("Model yüklendi: %s", path)
