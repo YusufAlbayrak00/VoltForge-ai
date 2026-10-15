@@ -44,7 +44,8 @@ class PricePredictor:
         )
         self.is_trained: bool = False
         self.features: List[str] = [
-            'hour', 'day_of_week', 'is_weekend', 'is_holiday', 'is_holiday_eve'
+            'hour', 'day_of_week', 'is_weekend', 'is_holiday',
+            'lag_24', 'lag_168', 'rolling_mean_24'
         ]
 
     def _extract_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -62,16 +63,34 @@ class PricePredictor:
           ``holidays.TR()`` takviminde yer alıyorsa (tatil arifesi) 1, aksi
           halde 0 (int). Çok günlük tatillerin ara günleri arife sayılmaz.
 
+        Zaman serisi öznitelikleri için veri önce ``target_date`` ve ``hour``
+        sütunlarına göre kronolojik olarak sıralanır (indeks sıfırlanır).
+        ``ptf_try_mwh`` sütunu varsa ek olarak şunlar üretilir (satır bazlı
+        kaydırma; ardışık saatlik veri varsayılır):
+
+        - ``lag_24``: 24 saat önceki (dün aynı saat) PTF, ``shift(24)``.
+        - ``lag_168``: 168 saat önceki (geçen hafta aynı gün/saat) PTF,
+          ``shift(168)``.
+        - ``rolling_mean_24``: Son 24 saatin hareketli PTF ortalaması,
+          ``shift(1).rolling(window=24).mean()``. ``shift(1)`` ile cari
+          saatin kendi fiyatı pencereye girmez (veri sızıntısı önlenir).
+
+        ``ptf_try_mwh`` yoksa (gelecek tahmin şablonu) ve bu sütunlar henüz
+        mevcut değilse ``0.0`` atanır. Kaydırmadan doğan ``NaN`` değerler
+        sırasıyla ``bfill``, ``ffill`` ve ``fillna(0.0)`` ile doldurulur.
+
         Orijinal DataFrame değiştirilmez; kopya üzerinde çalışılır.
 
         Args:
             df: ``target_date`` ve ``hour`` sütunlarını içeren DataFrame.
 
         Returns:
-            ``day_of_week``, ``is_weekend``, ``is_holiday`` ve
-            ``is_holiday_eve`` sütunları eklenmiş DataFrame.
+            Takvim ve zaman serisi öznitelik sütunları eklenmiş, kronolojik
+            olarak sıralanmış DataFrame.
         """
         result: pd.DataFrame = df.copy()
+        result = result.sort_values(by=['target_date', 'hour']).reset_index(drop=True)
+
         dates: pd.Series = pd.to_datetime(result['target_date'], format='%Y-%m-%d')
         result['day_of_week'] = dates.dt.dayofweek.astype(int)
         result['is_weekend'] = (result['day_of_week'] >= 5).astype(int)
@@ -81,6 +100,23 @@ class PricePredictor:
         next_dates: pd.Series = dates + pd.Timedelta(days=1)
         next_is_holiday: pd.Series = next_dates.dt.date.map(lambda d: d in tr_holidays)
         result['is_holiday_eve'] = (next_is_holiday & (result['is_holiday'] == 0)).astype(int)
+
+        lag_columns: List[str] = ['lag_24', 'lag_168', 'rolling_mean_24']
+        if 'ptf_try_mwh' in result.columns:
+            result['lag_24'] = result['ptf_try_mwh'].shift(24)
+            result['lag_168'] = result['ptf_try_mwh'].shift(168)
+            # shift(1): cari saatin fiyatı pencereye girmez -> data leakage yok.
+            result['rolling_mean_24'] = (
+                result['ptf_try_mwh'].shift(1).rolling(window=24).mean()
+            )
+        else:
+            for col in lag_columns:
+                if col not in result.columns:
+                    result[col] = 0.0
+
+        result[lag_columns] = (
+            result[lag_columns].bfill().ffill().fillna(0.0)
+        )
         return result
 
     def _validate_training_data(self, df: pd.DataFrame) -> None:
