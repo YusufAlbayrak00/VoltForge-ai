@@ -6,7 +6,8 @@ saatlik elektrik fiyatlarına göre fabrikanın enerji maliyetini en aza indiren
 matematiksel optimizasyon ve yük kaydırma (load shifting / arbitraj) algoritmalarını yürütür.
 """
 
-from typing import Dict, List, Optional
+import math
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -251,4 +252,166 @@ class LoadOptimizer:
             "active_shifts": [shifts[s]["name"] for s in range(n_shifts) if y_shift[s] == 1],
             "hourly_load_kw": [round(float(v), 2) for v in hourly_load],
             "hourly_mode": hourly_mode,
+        }
+
+    def validate_capacity(self) -> Dict[str, Any]:
+        """Vardiya kapasitesinin günlük üretim kotasını karşılayıp karşılamadığını denetler.
+
+        İzin verilen (`allowed=True`) vardiyalar arasından net çalışma saati en yüksek olan
+        `max_active_shifts` kadar vardiya seçilir. Her vardiyanın net kapasitesi
+        `max(0, saat sayısı - mola saati)` olarak hesaplanır ve toplanır. Bu toplam,
+        `req_max_hours + req_med_hours` kotasıyla karşılaştırılır.
+
+        Returns:
+            Şu anahtarları içeren sözlük: `is_feasible` (bool), `total_capacity_hours` (int),
+            `required_quota_hours` (int), `slack_hours` (int, kapasite - kota) ve
+            `warning_message` (str | None; kapasite yetersizse Türkçe açıklama, aksi halde None).
+        """
+        break_hours = int(self.shift_config["break_hours_per_shift"])
+        max_active = int(self.shift_config["max_active_shifts"])
+
+        net_hours = sorted(
+            (
+                max(0, len(s["hours"]) - break_hours)
+                for s in self.shift_config["shifts"]
+                if s.get("allowed", True)
+            ),
+            reverse=True,
+        )
+        total_capacity = int(sum(net_hours[:max_active]))
+        required_quota = int(self.req_max_hours + self.req_med_hours)
+        slack = total_capacity - required_quota
+        is_feasible = total_capacity >= required_quota
+
+        warning: Optional[str] = None
+        if not is_feasible:
+            warning = (
+                f"Vardiya kapasitesi yetersiz: izin verilen en uygun {max_active} vardiyanın "
+                f"mola düşüldükten sonraki net çalışma kapasitesi {total_capacity} saat, "
+                f"günlük zorunlu üretim kotası ise {required_quota} saat "
+                f"({self.req_max_hours} ağır + {self.req_med_hours} orta hat). "
+                f"{-slack} saatlik açık nedeniyle optimizasyon çözümsüz olacaktır. "
+                "Çözüm için aktif vardiya sayısını artırın, yasaklı vardiyaları açın, "
+                "mola süresini azaltın veya üretim kotasını düşürün."
+            )
+
+        return {
+            "is_feasible": is_feasible,
+            "total_capacity_hours": total_capacity,
+            "required_quota_hours": required_quota,
+            "slack_hours": slack,
+            "warning_message": warning,
+        }
+
+    def _build_baseline_schedule(self, ptf_prices: List[float]) -> Dict[str, Any]:
+        """Fiyatlardan bağımsız, geleneksel (gündüz ağırlıklı) üretim çizelgesini simüle eder.
+
+        Toplam enerji MILP çözümüyle birebir aynı kalacak şekilde `req_max_hours` kadar saat
+        önce gündüz pik saatlerine (`10, 11, 13, 14, 15, 16, 9, 17, ...`), `req_med_hours`
+        kadar saat ise kalan gündüz/akşam saatlerine (08:00-22:00), yetmezse kalan
+        saatlere atanır. Geleneksel çizelge vardiya kısıtlarını dikkate almaz.
+
+        Args:
+            ptf_prices: Saatlik PTF listesi (24 eleman, TL/MWh).
+
+        Returns:
+            `baseline_load_kw` (24 saatlik yük listesi), `baseline_mode` (saatlik mod listesi),
+            `baseline_cost_tl` (baz yük dahil günlük fatura) ve `total_energy_kwh`.
+
+        Raises:
+            ValueError: `ptf_prices` 24 eleman değilse veya kota 24 saati aşıyorsa.
+        """
+        if ptf_prices is None or len(ptf_prices) != 24:
+            raise ValueError("ptf_prices tam olarak 24 adet saatlik fiyat içermelidir.")
+        if self.req_max_hours + self.req_med_hours > 24:
+            raise ValueError("Toplam üretim kotası 24 saati aşamaz; geleneksel çizelge kurulamaz.")
+
+        ptf_kwh = np.asarray(ptf_prices, dtype=float) / 1000.0
+
+        # Ağır hat önceliği: gündüz pik saatleri, sonra kalan gündüz/akşam, sonra gece
+        max_priority: List[int] = [10, 11, 13, 14, 15, 16, 9, 17, 12, 8, 18, 19, 20, 21, 22, 23] + list(range(0, 8))
+        max_hours = max_priority[: self.req_max_hours]
+
+        # Orta hat: kalan 08:00-22:00 saatleri, yetmezse kalan diğer saatler
+        remaining = [h for h in range(24) if h not in max_hours]
+        med_pool = [h for h in remaining if 8 <= h < 22] + [h for h in remaining if not 8 <= h < 22]
+        med_hours = med_pool[: self.req_med_hours]
+
+        load = np.full(24, self.p_base_kw, dtype=float)
+        mode = ["Light_Load"] * 24
+        for h in max_hours:
+            load[h] += self.p_max_net_kw
+            mode[h] = "Maximum_Load"
+        for h in med_hours:
+            load[h] += self.p_med_net_kw
+            mode[h] = "Medium_Load"
+
+        return {
+            "baseline_load_kw": [round(float(v), 2) for v in load],
+            "baseline_mode": mode,
+            "baseline_cost_tl": round(float(np.sum(load * ptf_kwh)), 2),
+            "total_energy_kwh": round(float(np.sum(load)), 2),
+        }
+
+    def compare_with_baseline(self, ptf_prices: List[float]) -> Dict[str, Any]:
+        """Optimize çizelgeyi geleneksel çizelgeyle karşılaştırıp tasarruf raporu üretir.
+
+        Önce `validate_capacity` ve `optimize_schedule` çağrılır. Çözüm bulunamazsa
+        (`optimized_cost_tl is None`) hata vermeden `status`, `capacity_check` ve
+        `None` değerli maliyet/tasarruf alanlarıyla döner.
+
+        Args:
+            ptf_prices: Saatlik PTF listesi (24 eleman, TL/MWh).
+
+        Returns:
+            `status`, `baseline_cost_tl`, `optimized_cost_tl`, `daily_savings_tl`,
+            `savings_percentage`, `annual_savings_tl` (260 iş günü), `total_daily_energy_kwh`,
+            `energy_equal` (iki senaryonun enerjisi eşit mi), `capacity_check` ve
+            `schedule_comparison` (geleneksel ve optimize saatlik yük listeleri) anahtarlarını
+            içeren sözlük.
+
+        Raises:
+            ValueError: `ptf_prices` geçersizse (`optimize_schedule` tarafından).
+        """
+        capacity = self.validate_capacity()
+        optimized = self.optimize_schedule(ptf_prices)
+
+        if optimized.get("optimized_cost_tl") is None:
+            return {
+                "status": optimized.get("status"),
+                "capacity_check": capacity,
+                "baseline_cost_tl": None,
+                "optimized_cost_tl": None,
+                "daily_savings_tl": None,
+                "savings_percentage": None,
+                "annual_savings_tl": None,
+                "total_daily_energy_kwh": None,
+                "energy_equal": None,
+                "schedule_comparison": None,
+            }
+
+        baseline = self._build_baseline_schedule(ptf_prices)
+        baseline_cost = float(baseline["baseline_cost_tl"])
+        optimized_cost = float(optimized["optimized_cost_tl"])
+
+        daily_savings = baseline_cost - optimized_cost
+        savings_pct = (daily_savings / baseline_cost * 100.0) if baseline_cost > 0 else 0.0
+        energy_equal = math.isclose(
+            baseline["total_energy_kwh"], optimized["total_energy_kwh"], abs_tol=0.01
+        )
+
+        return {
+            "status": optimized["status"],
+            "capacity_check": capacity,
+            "baseline_cost_tl": round(baseline_cost, 2),
+            "optimized_cost_tl": round(optimized_cost, 2),
+            "daily_savings_tl": round(daily_savings, 2),
+            "savings_percentage": round(savings_pct, 2),
+            "annual_savings_tl": round(daily_savings * 260, 2),
+            "total_daily_energy_kwh": optimized["total_energy_kwh"],
+            "energy_equal": energy_equal,
+            "schedule_comparison": {
+                "baseline_load_kw": baseline["baseline_load_kw"],
+                "optimized_load_kw": optimized["hourly_load_kw"],
+            },
         }
