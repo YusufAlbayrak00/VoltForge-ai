@@ -22,3 +22,6 @@ holidays
 
 # Gradyan Artırmalı Karar Ağaçları (Fiyat Tahmin Modeli)
 lightgbm
+
+# Optimizasyon (MILP - Karışık Tamsayılı Doğrusal Programlama)
+scipy
