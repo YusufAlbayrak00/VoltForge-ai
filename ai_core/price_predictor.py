@@ -299,8 +299,9 @@ class PricePredictor:
         ``historical_df`` verilmişse geçmiş veri ile 24 saatlik gelecek şablonu
         alt alta birleştirilir ve ``_extract_features`` birleşik tablo üzerinde
         çalıştırılır; böylece ``lag_24``, ``lag_168`` ve ``rolling_mean_24``
-        gerçek geçmiş fiyatlardan hesaplanır. Yalnızca son 24 satır (gelecek
-        günü) tahmin için kullanılır. ``historical_df`` verilmezse öznitelikler
+        gerçek geçmiş fiyatlardan hesaplanır. Geçmişten yalnızca ``target_date``
+        öncesi satırlar kullanılır; tahmin satırları ``target_date`` eşleşmesiyle
+        seçilir. ``historical_df`` verilmezse öznitelikler
         doğrudan şablon üzerinde üretilir (lag sütunları ``0.0`` olur).
         Tahminler negatif olamayacağı için ``np.maximum(preds, 0.0)`` ile
         sınırlanır ve 2 ondalığa yuvarlanır.
@@ -326,12 +327,30 @@ class PricePredictor:
             )
 
         future_grid: pd.DataFrame = self._create_prediction_grid(target_date)
+        # Tarih biçimini normalize et (ör. "2026-10-8" -> "2026-10-08"); böylece
+        # birleşik tabloda tarih eşleştirmesi güvenilir olur.
+        target_ts: pd.Timestamp = pd.to_datetime(target_date, format='%Y-%m-%d')
+        target_date = target_ts.strftime('%Y-%m-%d')
+        future_grid['target_date'] = target_date
 
+        history: pd.DataFrame | None = None
         if historical_df is not None and not historical_df.empty:
-            combined_df: pd.DataFrame = pd.concat(
-                [historical_df.copy(), future_grid], ignore_index=True
+            # Yalnızca tahmin gününden ÖNCEKİ veri kullanılır: aynı gün veya sonrası
+            # (gerçekleşmiş fiyat vb.) hem veri sızıntısına hem de çift satıra yol açar.
+            history_dates: pd.Series = pd.to_datetime(
+                historical_df['target_date'], format='%Y-%m-%d'
             )
-            featured_future: pd.DataFrame = self._extract_features(combined_df).tail(24).copy()
+            history = historical_df.loc[history_dates < target_ts].copy()
+
+        if history is not None and not history.empty:
+            combined_df: pd.DataFrame = pd.concat([history, future_grid], ignore_index=True)
+            featured_all: pd.DataFrame = self._extract_features(combined_df)
+            # tail(24) yerine tarih eşleşmesiyle seç: sıralama/boşluk durumlarında güvenli.
+            featured_future: pd.DataFrame = (
+                featured_all[featured_all['target_date'] == target_date]
+                .sort_values('hour')
+                .copy()
+            )
         else:
             featured_future = self._extract_features(future_grid)
 

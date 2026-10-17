@@ -5,19 +5,26 @@ ve `DatabaseManager` (kalıcı veri katmanı) bileşenlerini tek bir akışta bi
 """
 
 import logging
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
 from ai_core.load_optimizer import LoadOptimizer
 from ai_core.price_predictor import PricePredictor
 from database.db_manager import DatabaseManager
+from integrations.epias_client import EpiasClient
 
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 METER_CSV_NAME: str = "Steel_industry_data.csv"
+
+# Eğitim için hazırlanacak geçmiş gün sayısı. lag_168 (7 gün) için en az 10 gün
+# gerekir; 14 gün, lag'lerin gerçek değerle dolu olduğu 7 günlük eğitim satırı bırakır.
+HISTORY_DAYS: int = 14
+MIN_HISTORY_HOURS: int = 240  # 10 gün
 
 
 class VoltForgePipeline:
@@ -44,6 +51,7 @@ class VoltForgePipeline:
         """
         self.db: DatabaseManager = DatabaseManager(db_path=db_path)
         self.predictor: PricePredictor = PricePredictor()
+        self.epias_client: EpiasClient = EpiasClient()
         self.meter_csv_path: Optional[str] = self._resolve_meter_csv(meter_csv_path)
 
     @staticmethod
@@ -128,3 +136,89 @@ class VoltForgePipeline:
         if profile is None:  # Teorik olarak ulaşılmaz; savunmacı kontrol
             raise RuntimeError(f"Fabrika profili kaydedilemedi: {factory_name}")
         return profile
+
+    def _build_historical_df(self, target_date: str, days: int = HISTORY_DAYS) -> pd.DataFrame:
+        """`target_date` öncesindeki `days` günlük saatlik PTF geçmişini hazırlar.
+
+        Her gün için `EpiasClient.fetch_daily_ptf` çağrılır; canlı API'ye erişilemezse
+        istemci kendisi simülasyon verisine düşer.
+
+        Args:
+            target_date: Tahmin günü (`YYYY-MM-DD`). Geçmiş bu günden bir gün öncesinde biter.
+            days: Hazırlanacak geçmiş gün sayısı.
+
+        Returns:
+            `target_date`, `hour`, `ptf_try_mwh` sütunlu, kronolojik sıralı DataFrame.
+        """
+        target_dt = datetime.strptime(target_date, "%Y-%m-%d")
+        records: List[Dict[str, Any]] = []
+        for offset in range(days, 0, -1):
+            day = (target_dt - timedelta(days=offset)).strftime("%Y-%m-%d")
+            records.extend(self.epias_client.fetch_daily_ptf(day))
+
+        history = pd.DataFrame(records, columns=["target_date", "hour", "ptf_try_mwh"])
+        return history.sort_values(["target_date", "hour"]).reset_index(drop=True)
+
+    def run_price_forecast(
+        self,
+        target_date: str,
+        historical_df: Optional[pd.DataFrame] = None,
+        actual_prices: Optional[List[float]] = None,
+    ) -> List[float]:
+        """Hedef gün için 24 saatlik PTF tahmini üretir ve veritabanına kaydeder.
+
+        Args:
+            target_date: Tahmin günü (`YYYY-MM-DD`).
+            historical_df: `target_date`, `hour`, `ptf_try_mwh` sütunlu geçmiş veri.
+                `None` ise `EpiasClient` üzerinden son `HISTORY_DAYS` gün hazırlanır.
+                Verilen veride `target_date` ve sonrası eğitimde kullanılmaz (sızıntı önlemi).
+            actual_prices: Opsiyonel, 24 elemanlı gerçekleşen fiyatlar (geriye dönük kayıt için).
+
+        Returns:
+            24 elemanlı tahmin listesi (TL/MWh).
+
+        Raises:
+            ValueError: `target_date` geçersizse, geçmiş veri yetersizse veya
+                `actual_prices` 24 elemanlı değilse.
+        """
+        try:
+            target_dt = datetime.strptime(target_date, "%Y-%m-%d")
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"Geçersiz target_date: {target_date!r}. Beklenen format: YYYY-MM-DD."
+            ) from exc
+        target_date = target_dt.strftime("%Y-%m-%d")
+
+        if actual_prices is not None and len(actual_prices) != 24:
+            raise ValueError(
+                f"actual_prices tam 24 elemanlı olmalıdır (gelen: {len(actual_prices)})."
+            )
+
+        if historical_df is None:
+            history = self._build_historical_df(target_date)
+        else:
+            dates = pd.to_datetime(historical_df["target_date"], format="%Y-%m-%d")
+            history = historical_df.loc[dates < pd.Timestamp(target_dt)].copy()
+
+        if len(history) < MIN_HISTORY_HOURS:
+            logger.warning(
+                "Geçmiş veri %d saat; önerilen en az %d saat (lag_168 için).",
+                len(history),
+                MIN_HISTORY_HOURS,
+            )
+
+        self.predictor.train(history)
+        forecast_df = self.predictor.predict(target_date, historical_df=history)
+        predicted_prices: List[float] = [
+            float(v) for v in forecast_df["predicted_ptf_try_mwh"].tolist()
+        ]
+        if len(predicted_prices) != 24:
+            raise ValueError(f"Tahmin 24 saatlik olmalıdır (üretilen: {len(predicted_prices)}).")
+
+        self.db.save_price_forecasts(
+            target_date=target_date,
+            predicted_prices=predicted_prices,
+            actual_prices=actual_prices,
+        )
+        logger.info("PTF tahmini üretildi ve kaydedildi: %s", target_date)
+        return predicted_prices
