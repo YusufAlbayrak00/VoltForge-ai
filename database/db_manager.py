@@ -4,12 +4,13 @@ Bu modül; `PricePredictor` ve `LoadOptimizer` çıktılarının kalıcı hale g
 fabrika profilleri, fiyat tahminleri ve optimizasyon raporları tablolarını yönetir.
 """
 
+import contextlib
 import json
 import logging
 import os
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -41,22 +42,46 @@ class DatabaseManager:
         self.db_path: str = str(DEFAULT_DB_PATH) if db_path is None else str(db_path)
         # ":memory:" modunda her sqlite3.connect() ayrı, boş bir veritabanı açar;
         # tabloların kaybolmaması için bu modda tek bir bağlantı paylaşılır.
-        self._memory_conn: Optional[sqlite3.Connection] = None
+        self._shared_conn: Optional[sqlite3.Connection] = None
         if self.db_path == MEMORY_DB:
-            self._memory_conn = sqlite3.connect(MEMORY_DB)
+            self._shared_conn = sqlite3.connect(MEMORY_DB)
         else:
             os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
-        """Yeni bir bağlantı döndürür (`with` ile kullanılmalıdır).
+    @contextlib.contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Transaction yönetimli güvenli bağlantı context manager'ı.
 
-        Returns:
-            Dosya modunda yeni `sqlite3.Connection`; `":memory:"` modunda paylaşılan bağlantı.
+        - `":memory:"` modu: Paylaşılan bağlantı kullanılır; `with conn:` bloğu
+          commit/rollback'i yönetir ancak bağlantı KAPATILMAZ (tablolar silinmesin).
+        - Dosya modu: Her çağrıda yeni bağlantı açılır; `with conn:` commit/rollback'i
+          yönetir ve `finally` içinde `conn.close()` ile dosya tanıtıcısı serbest bırakılır.
+
+        Yields:
+            Açık `sqlite3.Connection` nesnesi.
         """
-        if self._memory_conn is not None:
-            return self._memory_conn
-        return sqlite3.connect(self.db_path)
+        if self._shared_conn is not None:
+            with self._shared_conn as conn:
+                yield conn
+            return
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+    def close(self) -> None:
+        """Paylaşılan bellek içi (`:memory:`) bağlantıyı manuel kapatır.
+
+        Dosya modunda her işlem bağlantısını kendisi kapattığı için yapılacak bir
+        şey yoktur. Birden fazla çağrılması güvenlidir. Kapatılan yöneticiye sonradan
+        işlem yapılırsa `sqlite3.ProgrammingError` fırlatılır.
+        """
+        if self._shared_conn is not None:
+            self._shared_conn.close()
 
     def _init_db(self) -> None:
         """Gerekli 3 ana tabloyu (yoksa) oluşturur."""
@@ -286,3 +311,114 @@ class DatabaseManager:
             ).fetchall()
 
         return [dict(row) for row in rows]
+
+    @staticmethod
+    def _json_default(obj: Any) -> Any:
+        """`json.dumps` için numpy gibi standart dışı sayısal tipleri dönüştürür.
+
+        Args:
+            obj: JSON'a doğrudan çevrilemeyen nesne.
+
+        Returns:
+            Python'un yerleşik tipine çevrilmiş değer.
+
+        Raises:
+            TypeError: Nesne dönüştürülemiyorsa.
+        """
+        if hasattr(obj, "tolist"):  # numpy array / numpy skaler
+            return obj.tolist()
+        raise TypeError(f"JSON'a çevrilemeyen tip: {type(obj).__name__}")
+
+    def save_optimization_report(
+        self,
+        factory_name: str,
+        target_date: str,
+        report: Dict[str, Any],
+    ) -> int:
+        """`LoadOptimizer.compare_with_baseline()` raporunu veritabanına kaydeder.
+
+        Sayısal özet alanları kendi sütunlarına yazılır (çözümsüz durumda `None`
+        olarak korunur → SQL `NULL`). `schedule_comparison`, `active_shifts`,
+        `capacity_check` ve `status` ise tek bir JSON olarak `schedule_comparison_json`
+        sütununa konur.
+
+        Args:
+            factory_name: Fabrika adı.
+            target_date: Optimizasyonun yapıldığı hedef gün (örn. "2026-10-18").
+            report: `compare_with_baseline()` çıktısı.
+
+        Returns:
+            Eklenen kaydın `id` değeri.
+        """
+        details_json = json.dumps(
+            {
+                "schedule_comparison": report.get("schedule_comparison"),
+                "active_shifts": report.get("active_shifts"),
+                "capacity_check": report.get("capacity_check"),
+                "status": report.get("status"),
+            },
+            ensure_ascii=False,
+            default=self._json_default,
+        )
+
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO optimization_reports (
+                    factory_name, target_date, baseline_cost_tl, optimized_cost_tl,
+                    daily_savings_tl, savings_percentage, annual_savings_tl,
+                    total_daily_energy_kwh, schedule_comparison_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    factory_name,
+                    target_date,
+                    report.get("baseline_cost_tl"),
+                    report.get("optimized_cost_tl"),
+                    report.get("daily_savings_tl"),
+                    report.get("savings_percentage"),
+                    report.get("annual_savings_tl"),
+                    report.get("total_daily_energy_kwh"),
+                    details_json,
+                ),
+            )
+            report_id = int(cursor.lastrowid)
+
+        logger.info(
+            "Optimizasyon raporu kaydedildi: %s / %s (id=%d)", factory_name, target_date, report_id
+        )
+        return report_id
+
+    def get_optimization_history(
+        self, factory_name: str, limit: int = 30
+    ) -> List[Dict[str, Any]]:
+        """Fabrikanın geçmiş optimizasyon raporlarını en yeniden eskiye döndürür.
+
+        Args:
+            factory_name: Fabrika adı.
+            limit: Döndürülecek en fazla rapor sayısı.
+
+        Returns:
+            `created_at DESC, id DESC` sıralı rapor sözlükleri. `schedule_comparison_json`
+            sütunu `json.loads()` ile sözlüğe çevrilip `details` anahtarı altında verilir
+            (sütun boşsa `None`).
+        """
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT * FROM optimization_reports
+                WHERE factory_name = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (factory_name, limit),
+            ).fetchall()
+
+        history: List[Dict[str, Any]] = []
+        for row in rows:
+            record: Dict[str, Any] = dict(row)
+            raw_json = record.pop("schedule_comparison_json")
+            record["details"] = json.loads(raw_json) if raw_json else None
+            history.append(record)
+        return history
