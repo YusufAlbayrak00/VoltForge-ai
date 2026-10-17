@@ -8,9 +8,15 @@ import json
 import logging
 import os
 import sqlite3
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# Proje kökü / data / voltforge.db (çalışma dizininden bağımsız varsayılan yol)
+DEFAULT_DB_PATH: Path = Path(__file__).resolve().parent.parent / "data" / "voltforge.db"
+
+MEMORY_DB: str = ":memory:"
 
 
 class DatabaseManager:
@@ -20,23 +26,41 @@ class DatabaseManager:
     böylece bağlantı sızıntısı önlenir ve hata durumunda işlem otomatik geri alınır.
 
     Attributes:
-        db_path: SQLite veritabanı dosyasının yolu.
+        db_path: SQLite veritabanı dosyasının yolu (veya `":memory:"`).
     """
 
-    def __init__(self, db_path: str = "data/voltforge.db") -> None:
+    def __init__(self, db_path: Optional[str] = None) -> None:
         """Yöneticiyi başlatır, klasörü oluşturur ve tabloları hazırlar.
 
         Args:
-            db_path: SQLite dosya yolu. Üst klasör yoksa otomatik oluşturulur.
+            db_path: SQLite dosya yolu. `None` ise proje kökündeki
+                `data/voltforge.db` kullanılır (çalışma dizininden bağımsız).
+                Özel bir yol veya `":memory:"` verilirse doğrudan o kullanılır.
+                Üst klasör yoksa otomatik oluşturulur.
         """
-        self.db_path: str = db_path
-        db_dir = os.path.dirname(os.path.abspath(self.db_path))
-        os.makedirs(db_dir, exist_ok=True)
+        self.db_path: str = str(DEFAULT_DB_PATH) if db_path is None else str(db_path)
+        # ":memory:" modunda her sqlite3.connect() ayrı, boş bir veritabanı açar;
+        # tabloların kaybolmaması için bu modda tek bir bağlantı paylaşılır.
+        self._memory_conn: Optional[sqlite3.Connection] = None
+        if self.db_path == MEMORY_DB:
+            self._memory_conn = sqlite3.connect(MEMORY_DB)
+        else:
+            os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
         self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        """Yeni bir bağlantı döndürür (`with` ile kullanılmalıdır).
+
+        Returns:
+            Dosya modunda yeni `sqlite3.Connection`; `":memory:"` modunda paylaşılan bağlantı.
+        """
+        if self._memory_conn is not None:
+            return self._memory_conn
+        return sqlite3.connect(self.db_path)
 
     def _init_db(self) -> None:
         """Gerekli 3 ana tabloyu (yoksa) oluşturur."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS factory_profiles (
@@ -121,7 +145,7 @@ class DatabaseManager:
 
         shift_config_json = json.dumps(shift_config, ensure_ascii=False)
 
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO factory_profiles (
@@ -167,7 +191,7 @@ class DatabaseManager:
             `shift_config_json` alanı `shift_config` sözlüğüne çevrilmiş profil
             sözlüğü; kayıt bulunamazsa `None`.
         """
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 "SELECT * FROM factory_profiles WHERE factory_name = ?",
@@ -180,3 +204,85 @@ class DatabaseManager:
         profile: Dict[str, Any] = dict(row)
         profile["shift_config"] = json.loads(profile.pop("shift_config_json"))
         return profile
+
+    def save_price_forecasts(
+        self,
+        target_date: str,
+        predicted_prices: List[float],
+        actual_prices: Optional[List[float]] = None,
+    ) -> int:
+        """24 saatlik PTF tahminlerini (ve varsa gerçekleşenleri) kaydeder.
+
+        24 satır tek bir transaction içinde `executemany` ile yazılır. Aynı
+        `(target_date, hour)` varsa `predicted_ptf` güncellenir; `actual_ptf` ise
+        yalnızca yeni değer verilmişse güncellenir, `None` ise mevcut değer
+        `COALESCE` ile korunur.
+
+        Args:
+            target_date: Hedef gün (örn. "2026-10-18").
+            predicted_prices: Saat 0..23 için tam 24 elemanlı tahmin listesi (TL/MWh).
+            actual_prices: Opsiyonel, saat 0..23 için tam 24 elemanlı gerçekleşen fiyatlar.
+
+        Returns:
+            Kaydedilen/güncellenen satır sayısı (24).
+
+        Raises:
+            ValueError: Listelerden biri 24 elemanlı değilse.
+        """
+        if len(predicted_prices) != 24:
+            raise ValueError(
+                f"predicted_prices tam 24 elemanlı olmalıdır (gelen: {len(predicted_prices)})."
+            )
+        if actual_prices is not None and len(actual_prices) != 24:
+            raise ValueError(
+                f"actual_prices tam 24 elemanlı olmalıdır (gelen: {len(actual_prices)})."
+            )
+
+        rows = [
+            (
+                target_date,
+                hour,
+                float(predicted_prices[hour]),
+                None if actual_prices is None else float(actual_prices[hour]),
+            )
+            for hour in range(24)
+        ]
+
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO price_forecasts (target_date, hour, predicted_ptf, actual_ptf)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(target_date, hour) DO UPDATE SET
+                    predicted_ptf = excluded.predicted_ptf,
+                    actual_ptf = COALESCE(excluded.actual_ptf, price_forecasts.actual_ptf)
+                """,
+                rows,
+            )
+
+        logger.info("PTF tahminleri kaydedildi: %s (%d satır)", target_date, len(rows))
+        return len(rows)
+
+    def get_price_forecasts(self, target_date: str) -> List[Dict[str, Any]]:
+        """Verilen gün için kayıtlı PTF tahminlerini saat sırasıyla döndürür.
+
+        Args:
+            target_date: Hedef gün (örn. "2026-10-18").
+
+        Returns:
+            `hour`, `predicted_ptf`, `actual_ptf`, `created_at` anahtarlı sözlüklerden
+            oluşan, `hour` artan sıralı liste; kayıt yoksa boş liste.
+        """
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT hour, predicted_ptf, actual_ptf, created_at
+                FROM price_forecasts
+                WHERE target_date = ?
+                ORDER BY hour ASC
+                """,
+                (target_date,),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
