@@ -364,7 +364,8 @@ class LoadOptimizer:
             ptf_prices: Saatlik PTF listesi (24 eleman, TL/MWh).
 
         Returns:
-            `status`, `baseline_cost_tl`, `optimized_cost_tl`, `daily_savings_tl`,
+            `status`, `active_shifts` (seçilen vardiya adları; çözümsüzse boş liste),
+            `baseline_cost_tl`, `optimized_cost_tl`, `daily_savings_tl`,
             `savings_percentage`, `annual_savings_tl` (260 iş günü), `total_daily_energy_kwh`,
             `energy_equal` (iki senaryonun enerjisi eşit mi), `capacity_check` ve
             `schedule_comparison` (geleneksel ve optimize saatlik yük listeleri) anahtarlarını
@@ -379,6 +380,7 @@ class LoadOptimizer:
         if optimized.get("optimized_cost_tl") is None:
             return {
                 "status": optimized.get("status"),
+                "active_shifts": optimized.get("active_shifts", []),
                 "capacity_check": capacity,
                 "baseline_cost_tl": None,
                 "optimized_cost_tl": None,
@@ -402,6 +404,7 @@ class LoadOptimizer:
 
         return {
             "status": optimized["status"],
+            "active_shifts": optimized.get("active_shifts", []),
             "capacity_check": capacity,
             "baseline_cost_tl": round(baseline_cost, 2),
             "optimized_cost_tl": round(optimized_cost, 2),
