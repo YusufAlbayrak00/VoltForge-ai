@@ -222,3 +222,66 @@ class VoltForgePipeline:
         )
         logger.info("PTF tahmini üretildi ve kaydedildi: %s", target_date)
         return predicted_prices
+
+    def run_daily_optimization(
+        self,
+        factory_name: str,
+        target_date: str,
+        ptf_prices: Optional[List[float]] = None,
+    ) -> Dict[str, Any]:
+        """Fabrika için günlük MILP optimizasyonunu çalıştırıp raporu kaydeder.
+
+        Akış: profil (yoksa varsayılanla otomatik kurulum) -> PTF fiyatları (verilmediyse
+        veritabanındaki 24 saatlik tahmin, yoksa/eksikse yeni tahmin) -> `LoadOptimizer`
+        -> `compare_with_baseline` -> `optimization_reports` kaydı.
+
+        Args:
+            factory_name: Fabrika adı.
+            target_date: Optimizasyon günü (`YYYY-MM-DD`).
+            ptf_prices: Opsiyonel, 24 saatlik PTF listesi (TL/MWh).
+
+        Returns:
+            `compare_with_baseline` raporu; ek olarak `report_id`, `factory_name`,
+            `target_date` ve kullanılan `ptf_prices` anahtarlarını içeren sözlük.
+            Çözümsüz durumda maliyet alanları `None` olur (rapor yine kaydedilir).
+
+        Raises:
+            ValueError: `target_date` geçersizse veya fiyat listesi geçersizse.
+        """
+        try:
+            datetime.strptime(target_date, "%Y-%m-%d")
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"Geçersiz target_date: {target_date!r}. Beklenen format: YYYY-MM-DD."
+            ) from exc
+
+        profile = self.db.get_factory_profile(factory_name)
+        if profile is None:
+            logger.info("Profil bulunamadı, varsayılan profil kuruluyor: %s", factory_name)
+            profile = self.setup_factory(factory_name)
+
+        if ptf_prices is None:
+            stored = self.db.get_price_forecasts(target_date)
+            if len(stored) == 24:
+                ptf_prices = [float(row["predicted_ptf"]) for row in stored]
+                logger.info("Kayıtlı PTF tahmini kullanılıyor: %s", target_date)
+            else:
+                ptf_prices = self.run_price_forecast(target_date)
+
+        optimizer = LoadOptimizer(shift_config=profile["shift_config"])
+        optimizer.p_base_kw = profile["p_base_kw"]
+        optimizer.p_med_net_kw = profile["p_med_net_kw"]
+        optimizer.p_max_net_kw = profile["p_max_net_kw"]
+        optimizer.req_med_hours = profile["req_med_hours"]
+        optimizer.req_max_hours = profile["req_max_hours"]
+
+        report = optimizer.compare_with_baseline(ptf_prices)
+        report_id = self.db.save_optimization_report(factory_name, target_date, report)
+
+        return {
+            **report,
+            "report_id": report_id,
+            "factory_name": factory_name,
+            "target_date": target_date,
+            "ptf_prices": list(ptf_prices),
+        }

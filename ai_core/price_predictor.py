@@ -345,22 +345,63 @@ class PricePredictor:
         if history is not None and not history.empty:
             combined_df: pd.DataFrame = pd.concat([history, future_grid], ignore_index=True)
             featured_all: pd.DataFrame = self._extract_features(combined_df)
-            # tail(24) yerine tarih eşleşmesiyle seç: sıralama/boşluk durumlarında güvenli.
-            featured_future: pd.DataFrame = (
-                featured_all[featured_all['target_date'] == target_date]
-                .sort_values('hour')
-                .copy()
+            # Tahmin satırları tarih eşleşmesiyle belirlenir. `_extract_features` veriyi
+            # (tarih, saat) sırasına dizdiği ve geçmiş yalnızca target_date öncesi olduğundan
+            # bu satırlar tablonun sonunda, saat sırasıyla (0..23) yer alır.
+            future_positions: np.ndarray = np.flatnonzero(
+                (featured_all['target_date'] == target_date).to_numpy()
             )
+            preds_list = self._predict_autoregressive(featured_all, future_positions)
+            featured_future: pd.DataFrame = featured_all.iloc[future_positions].copy()
+            featured_future['predicted_ptf_try_mwh'] = np.round(preds_list, 2)
         else:
             featured_future = self._extract_features(future_grid)
-
-        X_pred: pd.DataFrame = featured_future[self.features]
-        preds = self.model.predict(X_pred)
-        featured_future['predicted_ptf_try_mwh'] = np.round(np.maximum(preds, 0.0), 2)
+            X_pred: pd.DataFrame = featured_future[self.features]
+            preds = self.model.predict(X_pred)
+            featured_future['predicted_ptf_try_mwh'] = np.round(np.maximum(preds, 0.0), 2)
 
         return featured_future[['target_date', 'hour', 'predicted_ptf_try_mwh']].reset_index(
             drop=True
         )
+
+    def _predict_autoregressive(
+        self, featured_all: pd.DataFrame, future_positions: np.ndarray
+    ) -> np.ndarray:
+        """Hedef günün saatlerini sırayla tahmin eder; her tahmin sonraki saati besler.
+
+        Her saat için ``rolling_mean_24``, birleşik tablodaki ``ptf_try_mwh`` sütununun
+        önceki 24 değerinden (``shift(1).rolling(24).mean()`` ile aynı mantık) yeniden
+        hesaplanır; ardından o saatin tahmini (negatif olamaz) ``ptf_try_mwh`` sütununa
+        yazılır. Pencerede eksik değer varsa ``_extract_features``'ın doldurduğu değer
+        korunur.
+
+        Args:
+            featured_all: Geçmiş + gelecek şablonu için öznitelikleri üretilmiş tablo.
+            future_positions: Tahmin edilecek satırların konumları (saat sırasıyla).
+
+        Returns:
+            Her tahmin satırı için (yuvarlanmamış, negatif olmayan) PTF tahmini.
+        """
+        features_df: pd.DataFrame = featured_all[self.features].copy()
+        ptf: np.ndarray = featured_all['ptf_try_mwh'].astype(float).to_numpy().copy()
+        rolling_col: int | None = (
+            features_df.columns.get_loc('rolling_mean_24')
+            if 'rolling_mean_24' in features_df.columns
+            else None
+        )
+
+        predictions: List[float] = []
+        for pos in future_positions:
+            if rolling_col is not None and pos >= 24:
+                window: np.ndarray = ptf[pos - 24:pos]
+                if not np.isnan(window).any():
+                    features_df.iat[pos, rolling_col] = float(window.mean())
+
+            pred: float = max(float(self.model.predict(features_df.iloc[[pos]])[0]), 0.0)
+            ptf[pos] = pred  # Sonraki saatin pencere/özniteliği için geri besle
+            predictions.append(pred)
+
+        return np.array(predictions)
 
     def save_model(self, filepath: str | Path) -> None:
         """Eğitilmiş modeli ``joblib`` ile diske kaydeder.

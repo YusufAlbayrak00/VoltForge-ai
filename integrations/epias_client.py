@@ -32,6 +32,14 @@ class EpiasClient:
     # Gürültü genliği: baz fiyatın ± %8'i kadar rastgele sapma.
     _NOISE_RATIO: float = 0.08
 
+    def __init__(self) -> None:
+        """İstemciyi başlatır.
+
+        `_fallback_warned`, simülasyon moduna düşüldüğünde uyarının yalnızca ilk
+        seferde yazdırılması için kullanılır (ardışık gün çağrılarında konsol kirlenmez).
+        """
+        self._fallback_warned: bool = False
+
     def _generate_mock_data(self, target_date: str) -> list[dict]:
         """Belirtilen tarih için 24 saatlik gerçekçi sahte PTF verisi üretir.
 
@@ -115,10 +123,13 @@ class EpiasClient:
             # Ham yanıtı standart şemaya çevir; şema bozuksa ValueError fırlatır.
             return self._parse_epias_response(raw_json)
         except (requests.exceptions.RequestException, ValueError) as error:
-            print(
-                "Canlı veri alınamadı, simülasyon verisi kullanılıyor... "
-                f"(Sebep: {type(error).__name__}: {error})"
-            )
+            if not self._fallback_warned:
+                print(
+                    "Canlı veri alınamadı, simülasyon verisi kullanılıyor... "
+                    f"(Sebep: {type(error).__name__}: {error}) "
+                    "[Bu uyarı bu oturumda yalnızca bir kez gösterilir.]"
+                )
+                self._fallback_warned = True
             return self._generate_mock_data(target_date)
 
     def _parse_epias_response(self, raw_json: dict) -> list[dict]:
